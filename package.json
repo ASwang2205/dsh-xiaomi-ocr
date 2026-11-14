@@ -15,7 +15,9 @@
     "docs/",
     "scripts/",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "keywords": [
     "deepseek-harness",
@@ -30,6 +32,18 @@
     "markdown"
   ],
   "license": "MIT",
+  "author": "ASwang2205",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ASwang2205/dsh-xiaomi-ocr.git"
+  },
+  "homepage": "https://github.com/ASwang2205/dsh-xiaomi-ocr#readme",
+  "bugs": {
+    "url": "https://github.com/ASwang2205/dsh-xiaomi-ocr/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=20"
   },

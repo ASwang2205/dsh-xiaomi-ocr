@@ -1,9 +1,29 @@
 # dsh-xiaomi-ocr
 
+> Local OCR for [DeepSeek Harness](https://deepseek-harness.github.io/deepseek-harness/):
+> Xiaomi-OCR-0 (0.8B) runs on your own GPU. Five tools, a dedicated settings
+> page, PDF support, OTSL tables and LaTeX formulas — no image ever leaves the
+> machine.
+
 本地 OCR 插件：把 **Xiaomi-OCR-0（0.8B 视觉语言模型）** 装进 DeepSeek Harness，图片不出本机。
 
 它替代云端 OCR 的那条链路：没有上传、没有按次计费、没有网络抖动、没有“服务繁忙”，
 也不受任何平台的内容审查影响。代价是本机要有 GPU 和一份约 1.7 GB 的权重 —— 一次性投入。
+
+## 安装
+
+```powershell
+git clone https://github.com/ASwang2205/dsh-xiaomi-ocr.git
+cd dsh-xiaomi-ocr
+pnpm pack                      # 产出 dsh-xiaomi-ocr-0.1.0.tgz
+```
+
+把 tgz 交给 DSH 的 Plugin Manager（或让 agent 调 `install_local_workbench`），
+然后重启 Harness。首次使用前还要准备：
+
+1. 一份带 `torch` + `transformers` 的 Python（见 [docs/runtime.md](docs/runtime.md)，可复用 ComfyUI 的环境）
+2. 模型权重（约 1.7 GB，命令在下方「运行时要求」）
+3. 打开 **设置 → 本地 OCR**，点「探测 Python」确认解释器，再点「启动」
 
 | 能力 | 说明 |
 | --- | --- |
@@ -62,8 +82,11 @@ ocr_vqa   path=chart.png question="哪一年增长最快？"
 └─ pylibs\                   # 插件私有 wheel（pypdfium2）
 ```
 
-插件按顺序探测解释器：设置里的 `pythonPath` → `~/.dsh/xiaomi-ocr/venv` →
-本机 ComfyUI 的 `.venv`（`D:\Comfy-Desktop\ComfyUI-Installs\*\ComfyUI\.venv`）。
+插件按顺序探测解释器：设置里的 `pythonPath` → 环境变量 `XIAOMI_OCR_PYTHON` → 上次成功探测到的解释器
+（缓存在 `runtime.json`）→ `~/.dsh/xiaomi-ocr/venv` → 设置里「额外搜索目录」下的 ComfyUI 布局
+（`<root>\<install>\ComfyUI\.venv\Scripts\python.exe`、`<root>\<install>\python_embeded\python.exe`）。
+
+探测成功的解释器会被记住，所以只要第一次能连上，之后重启也不需要重新配置。
 
 没有现成环境时：
 

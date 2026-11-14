@@ -13,11 +13,18 @@
 
 ## 方案 A：复用已有环境（推荐，零重复下载）
 
-本机 ComfyUI 的 venv 已经带 ROCm 版 torch，插件会**自动探测**：
+如果机器上已经有 ComfyUI（桌面版或整合包），它的 venv 通常就带 ROCm/CUDA 版 torch。
+把安装根目录填进设置页「运行时 → 额外搜索目录」，插件会按 ComfyUI 的目录布局找解释器：
 
 ```
-D:\Comfy-Desktop\ComfyUI-Installs\ComfyUI (1)\ComfyUI\.venv\Scripts\python.exe
+<root>\
+└─ <install>\
+   └─ ComfyUI\
+      └─ .venv\Scripts\python.exe
 ```
+
+例如 root 填 `D:\Comfy-Desktop\ComfyUI-Installs`，就能匹配
+`D:\Comfy-Desktop\ComfyUI-Installs\ComfyUI (1)\ComfyUI\.venv\Scripts\python.exe`。
 
 验证：
 
