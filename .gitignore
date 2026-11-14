@@ -7,3 +7,5 @@ node_modules/
 logs/
 tmp/
 *.log
+__pycache__/
+*.pyc

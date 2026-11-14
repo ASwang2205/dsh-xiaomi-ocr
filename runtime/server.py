@@ -83,16 +83,33 @@ def _load_image(source: str):
     return img.convert("RGB")
 
 
-def _fit(img, max_pixels: int):
-    """Downscale so that width*height <= max_pixels, preserving aspect ratio."""
+def _fit(img, max_pixels: int, min_side: int = 0):
+    """Scale so width*height <= max_pixels; upscale tiny crops for legibility."""
     from PIL import Image
 
     w, h = img.size
+    if min_side and max(w, h) < min_side:
+        scale = min_side / float(max(w, h))
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        return img.resize((nw, nh), Image.LANCZOS), nw, nh
     if max_pixels <= 0 or w * h <= max_pixels:
         return img, w, h
     scale = (max_pixels / float(w * h)) ** 0.5
     nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
     return img.resize((nw, nh), Image.LANCZOS), nw, nh
+
+
+def _crop(img, box):
+    if not box:
+        return img
+    x, y, w, h = (int(v) for v in box)
+    if w <= 0 or h <= 0:
+        raise ValueError("crop width/height must be positive")
+    left, top = max(0, x), max(0, y)
+    right, bottom = min(img.width, x + w), min(img.height, y + h)
+    if right <= left or bottom <= top:
+        raise ValueError("crop box is outside the image")
+    return img.crop((left, top, right, bottom))
 
 
 # --------------------------------------------------------------------------- #
@@ -244,9 +261,56 @@ class OcrEngine:
         del torch
         return inputs, geo, text
 
+    def _generate_once(self, messages, max_new_tokens, max_pixels, images=None):
+        import torch
+
+        if images is not None:
+            images_in, geo = [], []
+            for img in images:
+                w0, h0 = img.size
+                fitted, w, h = _fit(img, max_pixels, self.args.min_side)
+                images_in.append(fitted)
+                geo.append({"width": w0, "height": h0, "sent_width": w, "sent_height": h})
+            text = self._render_text(messages)
+            inputs = self.processor(text=[text], images=images_in, return_tensors="pt").to(self.device)
+        else:
+            inputs, geo, text = self.build_inputs(messages, max_pixels)
+
+        pv = inputs.get("pixel_values")
+        if pv is not None and pv.dtype != self.model.dtype:
+            inputs["pixel_values"] = pv.to(self.model.dtype)
+
+        n_in = int(inputs["input_ids"].shape[1])
+        gen_kwargs = dict(max_new_tokens=max_new_tokens, do_sample=False)
+        if self.args.repetition_penalty and self.args.repetition_penalty != 1.0:
+            gen_kwargs["repetition_penalty"] = self.args.repetition_penalty
+
+        t0 = time.time()
+        with torch.inference_mode():
+            out = self.model.generate(**inputs, **gen_kwargs)
+        dt = time.time() - t0
+        n_out = int(out.shape[1] - n_in)
+        decoded = self.processor.batch_decode(out[:, n_in:], skip_special_tokens=True)[0]
+        decoded = THINK_RE.sub("", decoded).strip()
+        return {
+            "text": decoded,
+            "prompt_tokens": n_in,
+            "completion_tokens": n_out,
+            "seconds": round(dt, 3),
+            "speed": round(n_out / dt, 2) if dt > 0 else None,
+            "images": geo,
+            "prompt_text": text,
+        }
+
     def generate(self, prompt=None, messages=None, images=None, max_new_tokens=None):
         """Run one generation. ``prompt`` + ``images`` is the internal fast path;
-        ``messages`` is the OpenAI-shaped one."""
+        ``messages`` is the OpenAI-shaped one.
+
+        Big pages are the main OOM risk here: the vision tower's attention grows
+        quadratically with patch count, so a 6 MP scan can ask for >20 GB even
+        though the language model is only 0.8B.  On OOM we halve the pixel budget
+        and retry instead of failing the call.
+        """
         import torch
 
         if messages is None:
@@ -264,18 +328,92 @@ class OcrEngine:
             self.lock.acquire()
             acquired = True
             self.queue -= 1
-            if images is not None:
-                images_in, geo = [], []
-                for img in images:
-                    w0, h0 = img.size
-                    fitted, w, h = _fit(img, self.args.max_pixels)
-                    images_in.append(fitted)
-                    geo.append({"width": w0, "height": h0, "sent_width": w, "sent_height": h})
-                text = self._render_text(messages)
-                inputs = self.processor(text=[text], images=images_in, return_tensors="pt").to(self.device)
-            else:
-                inputs, geo, text = self.build_inputs(messages, self.args.max_pixels)
 
+            budget = int(self.args.max_pixels) or 3_600_000
+            retries = 0
+            while True:
+                try:
+                    result = self._generate_once(messages, max_new_tokens, budget, images=images)
+                    break
+                except torch.OutOfMemoryError:
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:  # pragma: no cover - CPU build
+                        pass
+                    if retries >= 2 or budget <= 700_000:
+                        raise
+                    retries += 1
+                    budget = max(700_000, budget // 2)
+                    LOG.warning("OOM: retrying with max_pixels=%d (attempt %d)", budget, retries)
+
+            self.requests += 1
+            self.prompt_tokens += result["prompt_tokens"]
+            self.completion_tokens += result["completion_tokens"]
+            self.latencies.append(result["seconds"])
+            self.latencies = self.latencies[-40:]
+            self.last_activity = time.time()
+            return {
+                **result,
+                "total_seconds": round(time.time() - t_start, 3),
+                "max_pixels": budget,
+                "retries": retries,
+            }
+        except Exception:
+            self.errors += 1
+            raise
+        finally:
+            if acquired:
+                self.lock.release()
+
+    # -- batch / detection --------------------------------------------------
+    def batch(self, prompt, images, max_new_tokens=None, max_pixels=None, crop=None, min_side=None):
+        """Run one prompt over several images in a single batched forward pass.
+
+        All samples share the same rendered prompt, so the batch needs no fancy
+        padding; this is what makes multi-page PDFs substantially faster than
+        page-by-page calls.
+        """
+        import torch
+
+        max_new_tokens = int(max_new_tokens or self.args.max_new_tokens)
+        max_pixels = int(max_pixels or self.args.max_pixels)
+        min_side = int(min_side if min_side is not None else self.args.min_side)
+        t_start = time.time()
+        acquired = False
+        self.queue += 1
+        try:
+            self.lock.acquire()
+            acquired = True
+            self.queue -= 1
+
+            prepared, geo = [], []
+            for img in images:
+                img = _crop(img, crop)
+                w0, h0 = img.size
+                fitted, w, h = _fit(img, max_pixels, min_side)
+                prepared.append(fitted)
+                geo.append({"width": w0, "height": h0, "sent_width": w, "sent_height": h})
+            if not prepared:
+                raise ValueError("no images to process")
+
+            text = self._render_text([{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}])
+            # Samples in a batch can differ in vision-token count, so the inputs
+            # get padded.  Decoder-only generation must pad on the left, else the
+            # shorter rows start generating from pad positions and emit garbage.
+            tokenizer = getattr(self.processor, "tokenizer", None)
+            previous_side = getattr(tokenizer, "padding_side", None)
+            if tokenizer is not None:
+                tokenizer.padding_side = "left"
+            try:
+                inputs = self.processor(
+                    text=[text] * len(prepared),
+                    images=[[img] for img in prepared],
+                    return_tensors="pt",
+                    padding=True,
+                ).to(self.device)
+            finally:
+                if tokenizer is not None and previous_side is not None:
+                    tokenizer.padding_side = previous_side
             pv = inputs.get("pixel_values")
             if pv is not None and pv.dtype != self.model.dtype:
                 inputs["pixel_values"] = pv.to(self.model.dtype)
@@ -286,28 +424,53 @@ class OcrEngine:
                 gen_kwargs["repetition_penalty"] = self.args.repetition_penalty
 
             t0 = time.time()
-            with torch.inference_mode():
-                out = self.model.generate(**inputs, **gen_kwargs)
+            try:
+                with torch.inference_mode():
+                    out = self.model.generate(**inputs, **gen_kwargs)
+            except torch.OutOfMemoryError:
+                LOG.warning("CUDA OOM while batching %d image(s); clearing cache", len(prepared))
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:  # pragma: no cover - CPU build
+                    pass
+                raise
+            finally:
+                if len(prepared) > 1:
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:  # pragma: no cover - CPU build
+                        pass
             dt = time.time() - t0
+            texts = [THINK_RE.sub("", t).strip() for t in self.processor.batch_decode(out[:, n_in:], skip_special_tokens=True)]
             n_out = int(out.shape[1] - n_in)
-            decoded = self.processor.batch_decode(out[:, n_in:], skip_special_tokens=True)[0]
-            decoded = THINK_RE.sub("", decoded).strip()
+
+            # Rows finish at different lengths and are then filled with pad (or
+            # eos) tokens, so the shared n_out overstates every row but the
+            # longest one.  Count real tokens per row for honest reporting.
+            pad_id = getattr(self.processor.tokenizer, "pad_token_id", None)
+            if pad_id is None:
+                pad_id = getattr(self.processor.tokenizer, "eos_token_id", None)
+            try:
+                token_counts = [int((out[i, n_in:] != pad_id).sum()) for i in range(out.shape[0])]
+            except Exception:  # pragma: no cover - defensive
+                token_counts = [n_out] * len(texts)
 
             self.requests += 1
             self.prompt_tokens += n_in
-            self.completion_tokens += n_out
+            self.completion_tokens += sum(token_counts)
             self.latencies.append(dt)
             self.latencies = self.latencies[-40:]
             self.last_activity = time.time()
             return {
-                "text": decoded,
-                "prompt_tokens": n_in,
-                "completion_tokens": n_out,
-                "seconds": round(dt, 3),
-                "speed": round(n_out / dt, 2) if dt > 0 else None,
-                "total_seconds": round(time.time() - t_start, 3),
+                "texts": texts,
                 "images": geo,
-                "prompt_text": text,
+                "batch_size": len(prepared),
+                "prompt_tokens": n_in,
+                "completion_tokens": token_counts,
+                "seconds": round(dt, 3),
+                "total_seconds": round(time.time() - t_start, 3),
+                "per_item_seconds": round(dt / len(prepared), 3),
+                "tokens_per_s": round(sum(token_counts) / dt, 2) if dt > 0 else None,
             }
         except Exception:
             self.errors += 1
@@ -316,9 +479,68 @@ class OcrEngine:
             if acquired:
                 self.lock.release()
 
+    def detect(self, source, max_pixels=None):
+        """Cheap layout heuristic so ``mode: auto`` can pick a sensible prompt."""
+        import numpy as np
+
+        try:
+            import PIL  # noqa: F401 - keeps the dependency check close to use
+        except Exception:  # pragma: no cover
+            return {"kind": "document", "reason": "no Pillow"}
+
+        img = _load_image(source)
+        img, _, _ = _fit(img, int(max_pixels or 2_000_000))
+        gray = np.asarray(img.convert("L"), dtype=np.uint8)
+        rgb = np.asarray(img, dtype=np.int16)
+        h, w = gray.shape
+        dark = gray < 128
+        ink = float(dark.mean())
+        row_ink = dark.mean(axis=1)
+        col_ink = dark.mean(axis=0)
+        h_lines = int((row_ink > 0.55).sum())
+        v_lines = int((col_ink > 0.55).sum())
+        colorfulness = float(np.abs(rgb[..., 0] - rgb[..., 1]).mean() + np.abs(rgb[..., 1] - rgb[..., 2]).mean())
+        background = float((gray > 200).mean())
+        pure_white = float((gray == 255).mean())
+        unique_colors = int(np.unique(rgb.reshape(-1, 3), axis=0).shape[0])
+        aspect = w / float(h) if h else 1.0
+
+        kind = "document"
+        if h_lines >= 3 and v_lines >= 2 and ink < 0.25:
+            kind = "table"
+        elif colorfulness > 12 and background < 0.45:
+            kind = "photo"
+        elif aspect >= 1.15 and pure_white > 0.5 and unique_colors < 400:
+            # UI screenshots are flat: exact-white canvas and very few colours
+            # (a scanned page has thousands of anti-aliased tones).
+            kind = "screenshot"
+        elif colorfulness > 6:
+            kind = "photo"
+
+        return {
+            "kind": kind,
+            "width": w,
+            "height": h,
+            "ink": round(ink, 4),
+            "background": round(background, 4),
+            "pure_white": round(pure_white, 4),
+            "colorfulness": round(colorfulness, 2),
+            "unique_colors": unique_colors,
+            "horizontal_lines": h_lines,
+            "vertical_lines": v_lines,
+        }
+
     # -- stats -------------------------------------------------------------
     def status(self):
         recent = self.latencies[-10:]
+        peak_vram_mb = None
+        try:
+            import torch
+
+            if self.device == "cuda" and torch.cuda.is_available():
+                peak_vram_mb = round(torch.cuda.max_memory_allocated() / (1024 * 1024))
+        except Exception:  # pragma: no cover - best effort
+            peak_vram_mb = None
         return {
             "ok": self.load_error is None and self.model is not None,
             "model": os.path.basename(self.model_dir.rstrip("\\/")),
@@ -336,6 +558,8 @@ class OcrEngine:
             "completion_tokens": self.completion_tokens,
             "avg_seconds": round(sum(recent) / len(recent), 2) if recent else None,
             "idle_s": round(time.time() - self.last_activity, 1),
+            "peak_vram_mb": peak_vram_mb,
+            "features": ["batch", "detect", "crop"],
         }
 
 
@@ -396,6 +620,83 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/shutdown":
             self._send_json({"ok": True, "bye": True})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+        if path == "/v1/ocr/detect":
+            if self.engine.model is None:
+                self._error(503, self.engine.load_error or "model not loaded", "service_unavailable")
+                return
+            try:
+                body = self._read_body()
+            except Exception as exc:
+                self._error(400, f"bad request body: {exc}")
+                return
+            source = body.get("image")
+            if not isinstance(source, str) or not source:
+                self._error(400, "'image' is required")
+                return
+            try:
+                self._send_json({"object": "ocr.detection", **self.engine.detect(source, body.get("max_pixels"))})
+            except FileNotFoundError as exc:
+                self._error(400, f"image not found: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                LOG.exception("detect failed")
+                self._error(500, f"{type(exc).__name__}: {exc}", "server_error")
+            return
+        if path == "/v1/ocr/batch":
+            if self.engine.model is None:
+                self._error(503, self.engine.load_error or "model not loaded", "service_unavailable")
+                return
+            try:
+                body = self._read_body()
+            except Exception as exc:
+                self._error(400, f"bad request body: {exc}")
+                return
+            prompt = body.get("prompt")
+            sources = body.get("images")
+            if not isinstance(prompt, str) or not prompt:
+                self._error(400, "'prompt' is required")
+                return
+            if not isinstance(sources, list) or not sources:
+                self._error(400, "'images' must be a non-empty list")
+                return
+            try:
+                images = [_load_image(src) for src in sources]
+                result = self.engine.batch(
+                    prompt,
+                    images,
+                    max_new_tokens=body.get("max_tokens") or body.get("max_completion_tokens"),
+                    max_pixels=body.get("max_pixels"),
+                    crop=body.get("crop"),
+                    min_side=body.get("min_side"),
+                )
+            except FileNotFoundError as exc:
+                self._error(400, f"image not found: {exc}")
+                return
+            except Exception as exc:  # noqa: BLE001 - surface to caller
+                LOG.exception("batch failed")
+                self._error(500, f"{type(exc).__name__}: {exc}", "server_error")
+                return
+            counts = result.get("completion_tokens") or []
+            self._send_json({
+                "object": "ocr.batch",
+                "results": [
+                    {
+                        "index": index,
+                        "text": text,
+                        "image": result["images"][index] if index < len(result["images"]) else None,
+                        "prompt_tokens": result.get("prompt_tokens"),
+                        "completion_tokens": counts[index] if index < len(counts) else None,
+                    }
+                    for index, text in enumerate(result["texts"])
+                ],
+                "batch": {
+                    "size": result["batch_size"],
+                    "seconds": result["seconds"],
+                    "total_seconds": result["total_seconds"],
+                    "per_item_seconds": result["per_item_seconds"],
+                    "tokens_per_s": result["tokens_per_s"],
+                },
+            })
             return
         if path not in ("/v1/chat/completions", "/v1/completions"):
             self._error(404, "not found")
@@ -495,6 +796,8 @@ def main(argv=None):
     parser.add_argument("--max-new-tokens", type=int, default=4096, dest="max_new_tokens")
     parser.add_argument("--max-pixels", type=int, default=3_600_000, dest="max_pixels",
                         help="downscale images larger than this many pixels (0 = never)")
+    parser.add_argument("--min-side", type=int, default=0, dest="min_side",
+                        help="upscale images whose longest side is below this (0 = never)")
     parser.add_argument("--repetition-penalty", type=float, default=1.0, dest="repetition_penalty")
     parser.add_argument("--idle-exit", type=float, default=0, dest="idle_exit",
                         help="exit after N idle seconds (0 = stay resident)")

@@ -1,7 +1,7 @@
 {
   "name": "dsh-xiaomi-ocr",
-  "version": "0.1.0",
-  "description": "Local OCR for DeepSeek Harness: Xiaomi-OCR-0 (0.8B) runs on this machine through a managed Python service. Five tools (ocr_image / ocr_pdf / ocr_kie / ocr_vqa / ocr_status), Markdown + OTSL/HTML tables + LaTeX formulas, result caching, PDF rasterisation, and a dedicated 本地 OCR settings page. No image ever leaves the device.",
+  "version": "0.2.0",
+  "description": "Local OCR for DeepSeek Harness: Xiaomi-OCR-0 (0.8B) runs on this machine through a managed Python service. Six tools (ocr_image / ocr_batch / ocr_pdf / ocr_kie / ocr_vqa / ocr_status), layout auto-detection, batched pages, region cropping, Markdown + OTSL/HTML tables + LaTeX formulas, result caching, PDF rasterisation, and a dedicated 本地 OCR settings page. No image ever leaves the device.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

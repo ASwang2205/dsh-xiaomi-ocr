@@ -69,6 +69,21 @@ python -c "from huggingface_hub import snapshot_download as s; s('xiaomi-researc
 
 可用 `--dtype` 显式覆盖（服务脚本参数）。
 
+## 显存与像素预算
+
+显存主要由**视觉塔**决定，而且随 patch 数平方增长，跟语言模型那 0.8B 关系不大：
+
+| 输入 | 视觉 token | 峰值显存 | 备注 |
+| --- | --- | --- | --- |
+| 932×1644 收据（1.5 MP） | ~1500 | 2–3 GB | 宽松 |
+| 1428×2520 A4 扫描（3.6 MP） | 3576 | **22.4 GB** | 16 GB 卡必 OOM |
+
+所以：
+
+- 默认 `--max-pixels 2200000`（A4@150 dpi 正好 2.2 MP）。再大先降采样。
+- 万一仍 OOM，服务把像素预算减半重试（最多两次），结果里带 `max_pixels` / `retries`。
+- 需要细腻小字时，优先用 `region` 只裁那一块（裁剪会按 `--min-side` 放大），而不是整页拉高 DPI。
+
 ## 端口与生命周期
 
 - 默认 `127.0.0.1:18765`，`GET /health` 可探活。

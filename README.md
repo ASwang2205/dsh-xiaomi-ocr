@@ -28,17 +28,21 @@ pnpm pack                      # 产出 dsh-xiaomi-ocr-0.1.0.tgz
 | 能力 | 说明 |
 | --- | --- |
 | 文档解析 | 版面 + 阅读顺序 → Markdown；表格 OTSL（可选转 HTML），公式 LaTeX |
+| 自动模式 | 先花 ~0.3 s 判版面（文档/截图/照片/表格），再选最合适的提示词 |
+| 批量 | 多图或 PDF 多页合并成一次前推，逐项提速约 2.6× |
+| 局部 | `region: "x,y,w,h"` 先裁剪再放大，抠表格/公式不再受整页分辨率拖累 |
 | 纯文本 | 单行/多行文字抽取 |
 | 表格 / 公式 | 单区域精修，输出 OTSL / LaTeX |
 | KIE | 给 JSON Schema 或字段清单，返回结构化 JSON（小票、发票、证件、运单） |
 | VQA | 就图片内容提问（图表、截图、手写） |
-| PDF | 逐页渲染 + 逐页识别，超长结果自动落盘 |
+| PDF | 逐页渲染 + 分页批量识别，超长结果自动落盘 |
 
 ## 工具
 
 | 工具 | 用途 |
 | --- | --- |
-| `ocr_image` | 单张图片。`mode`: `document` / `text` / `table` / `formula` / `page` |
+| `ocr_image` | 单张图片。`mode`: `auto` / `document` / `text` / `table` / `formula` / `page`；`region` 可裁剪 |
+| `ocr_batch` | 多张图片一次调用，按像素预算自动分组，按文件名分节输出 |
 | `ocr_pdf` | PDF。`pages: "1-5,8"`、`dpi`、`maxPages`，结果按页分块 |
 | `ocr_kie` | 关键信息抽取，返回 JSON |
 | `ocr_vqa` | 图片问答 |
@@ -47,8 +51,11 @@ pnpm pack                      # 产出 dsh-xiaomi-ocr-0.1.0.tgz
 示例：
 
 ```text
-ocr_image path=D:\scan\invoice.png                    # 整页 → Markdown
-ocr_pdf   path=D:\docs\paper.pdf pages=1-3 dpi=200    # 前 3 页，高清
+ocr_image path=D:\scan\invoice.png                          # 整页 → Markdown
+ocr_image path=D:\scan\page.png region=120,340,900,420       # 只抠那张表
+ocr_image path=D:\shots\chat.png mode=page                   # 截图/聊天记录保换行
+ocr_batch paths=["a.png","b.png","c.png"]                    # 三张一起推
+ocr_pdf   path=D:\docs\paper.pdf pages=1-3 dpi=200           # 前 3 页，高清
 ocr_kie   path=receipt.jpg schema={"total":"string","date":"string"}
 ocr_vqa   path=chart.png question="哪一年增长最快？"
 ```
@@ -64,7 +71,7 @@ ocr_vqa   path=chart.png question="哪一年增长最快？"
 - **服务状态**：运行中/未运行、设备、精度、平均耗时、队列、缓存条目；启动 / 停止 / 重启 / 探测 Python
 - **运行时**：Python 路径（自动探测 ComfyUI 的 ROCm 环境）、模型目录、端口、自动启动、空闲退出秒数、打开数据目录 / 日志、清空缓存
 - **后端**：内置本地服务 或 任意 OpenAI 兼容端点（Ollama / llama.cpp / SGLang / 云端）
-- **识别默认值**：默认模式、最大 tokens、最大像素、PDF DPI / 页数上限、截断阈值、表格转 HTML、结果缓存
+- **识别默认值**：默认模式（含 `auto`）、最大 tokens、最大像素、PDF DPI / 页数上限、截断阈值、表格转 HTML、结果缓存、批量并发、失败重试
 - **试运行**：填一张图，直接在页面里跑一次，看输出与耗时
 
 所有字段都是 `.volatile()` 配置，改动即时生效并持久化到本 profile 的 `cordis.patch.yml`。
@@ -103,9 +110,9 @@ python -c "from huggingface_hub import snapshot_download as s; s('xiaomi-researc
 ## 实现
 
 ```
-lib/index.js      宿主半：5 个工具 + Runtime 监管 + 结果缓存 + 设置页 RPC
+lib/index.js      宿主半：6 个工具 + Runtime 监管 + 结果缓存 + 设置页 RPC
 lib/client.js     浏览器半：settings.section 分页（手写 lazy-CJS，无构建步骤）
-runtime/server.py 本地推理服务：OpenAI 兼容 /v1/chat/completions，模型常驻显存
+runtime/server.py 本地推理服务：OpenAI 兼容 /v1/chat/completions + /v1/ocr/batch + /v1/ocr/detect
 runtime/render_pdf.py  PDF → PNG（pypdfium2，装在插件私有目录）
 ```
 
@@ -113,6 +120,8 @@ runtime/render_pdf.py  PDF → PNG（pypdfium2，装在插件私有目录）
 - 首次工具调用会按需拉起服务（模型加载约 2–4 s）；空闲 1800 s 自动释放显存。
 - 同一个 Python 进程完成解码/预处理/生成，避免 torchvision 缺少 libjpeg 的坑；
   **fp16 在 AMD ROCm 上比 bf16 快一倍**，插件按后端自动选精度。
+- 批量前推时同一提示词的所有样本共享一次 forward；不同尺寸的样本左填充，
+  短样本才不会被 pad 位带偏。
 
 ## 实测性能（RX 6800 XT / ROCm 7.14 / fp16）
 
@@ -122,8 +131,14 @@ runtime/render_pdf.py  PDF → PNG（pypdfium2，装在插件私有目录）
 | 论文公式页 1800×1303 | 1822 tokens | 57.1 s |
 | 表格 880×420 | 124 tokens | 4.0 s（命中缓存则 <0.1 s） |
 | 单页 PDF（含渲染） | 294 tokens | 10.6 s |
+| 同图 1 / 2 / 3 张批量 | — | 2.8 / 3.1 / 3.2 s（单张摊薄 2.6×） |
+| 两页 PDF（150 dpi，批量 2） | 426 tokens | 21 s |
 
 bf16 同样输入约 12.9 tok/s —— 慢一倍，所以默认走 fp16。
+
+显存不是线性的：视觉塔的开销随 patch 数平方增长，3.6 MP 的 A4 扫描会要 20 GB 以上。
+所以默认像素上限是 2.2 MP（A4@150 dpi），超了先降采样；万一还是 OOM，服务会自动
+把像素预算减半重试（最多两次）并在结果里标注。
 
 ## 排查
 
@@ -138,7 +153,8 @@ bf16 同样输入约 12.9 tok/s —— 慢一倍，所以默认走 fp16。
 ## 已知限制
 
 - OTSL → HTML 是尽力而为：合并单元格（`<lcel>/<ucel>` 跨行列）转成空 `<td>`，不做 rowspan/colspan。
-- PDF 逐页串行（单卡单模型），20 页约 3 分钟；大文档建议先用 `pages` 分段。
+- PDF 分页批量后仍受单卡限制：两页一批时约 21 s，20 页约 3 分钟；大文档建议先用 `pages` 分段。
+- `auto` 的版式判定是图像启发式（墨量/纯白比/颜色数/长直线），不是目标检测模型；边界情况会回退 `document`。
 - `page` 模式对书法/场景文字的提示词是插件自定的，不是上游原句；`document/text/table/formula` 用的都是上游原文提示词。
 - Windows + ROCm 下没装 libjpeg 的 torchvision 不能直接吃图片路径，插件已改走 PIL，无需处理。
 
