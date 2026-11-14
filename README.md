@@ -115,6 +115,21 @@ bf16 同样输入约 12.9 tok/s —— 慢一倍，所以默认走 fp16。
 - `page` 模式对书法/场景文字的提示词是插件自定的，不是上游原句；`document/text/table/formula` 用的都是上游原文提示词。
 - Windows + ROCm 下没装 libjpeg 的 torchvision 不能直接吃图片路径，插件已改走 PIL，无需处理。
 
+## 开发
+
+```powershell
+node tests/smoke.mjs     # 宿主半解析 + OTSL 转换 + 客户端 bundle 的 slot 注册
+pnpm pack                # 产出 dsh-xiaomi-ocr-<version>.tgz（≤8 MiB）
+```
+
+装进本机 profile 用 DSH 的 `install_local_workbench`；改动代码后需要重启 Harness 才生效
+（包被移动到新 generation，运行中的进程还持有旧副本）。
+
+两条硬性契约，改动时别丢：
+
+- `package.json` 的 `dsh.client.inject` 必须包含 `"dsh-desktop-workbenches"`，否则 Desktop 的本地安装器拒收。
+- `cordis.patch.yml` 里的条目 `id`（`xiaomi-ocr`）就是设置命名空间；`lib/client.js` 的 `ENTRY_ID` 必须与之一致。
+
 ## 许可
 
 插件代码 MIT。模型权重为 Apache-2.0（[xiaomi-research/Xiaomi-OCR-0](https://huggingface.co/xiaomi-research/Xiaomi-OCR-0)），使用与再分发请遵守其条款。
