@@ -1,0 +1,9 @@
+# build output
+*.tgz
+
+# local scratch
+node_modules/
+.cache/
+logs/
+tmp/
+*.log

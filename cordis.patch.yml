@@ -1,0 +1,15 @@
+# dsh-xiaomi-ocr — 本地 OCR（Xiaomi-OCR-0，0.8B）
+#
+# 由本插件托管的本地推理服务提供 OCR 能力：模型常驻显存，图片不出本机。
+# 所有可调项都在「设置 → 本地 OCR」分页里，写入会持久化到本 profile 的
+# cordis.patch.yml（本条目 config 之下）。
+#
+# 首次使用前需要：模型权重（~/.dsh/xiaomi-ocr/models/Xiaomi-OCR-0）与一个带
+# torch + transformers 的 Python 解释器。设置页的「运行时」卡片会显示探测结果。
+
+- insert:
+    - id: xiaomi-ocr
+      name: dsh-xiaomi-ocr
+      config:
+        backend: managed
+        mode: document
