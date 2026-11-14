@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Smoke test (host parse, OTSL converter, client slot registration)
+        run: node tests/smoke.mjs
+      - name: Package contract (Desktop local installer)
+        run: |
+          node -e "
+          const pkg = require('./package.json');
+          const assert = require('node:assert/strict');
+          assert.equal(pkg.dsh.client.platform, 'web');
+          assert.ok(pkg.dsh.client.inject.includes('dsh-desktop-workbenches'));
+          assert.equal(typeof pkg.dsh.bundle.patch, 'string');
+          assert.equal(typeof pkg.exports['./client'], 'string');
+          assert.ok(pkg.version);
+          console.log('package contract ok:', pkg.name, pkg.version);
+          "
+      - name: Python runtime syntax
+        run: |
+          python3 -m py_compile runtime/server.py runtime/render_pdf.py
+          echo "runtime scripts compile"
